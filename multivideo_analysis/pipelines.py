@@ -16,7 +16,7 @@ from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import StandardScaler
 from scipy.spatial.distance import cdist
 
-FEATURES_DIR = 'Project_Features'
+FEATURES_DIR = '../Project_Features'
 
 CANDIDATES = [
     'Cotrim_Figueiredo', 'Filipe', 'Gouveia_Melo',
@@ -627,6 +627,7 @@ def build_seg_all(debate_videos, data_audio, labels_all, features_dir=None):
         df_valid = df_valid.rename(columns={
             'Frame_Number': 'frame_number',
             'Person_Index': 'person_index',
+            'Top_Emotion':  'top_emotion',
         })
 
         # ── frame → audio join (corelations_updated cell 8) ──────────────────
@@ -686,7 +687,8 @@ def build_seg_all(debate_videos, data_audio, labels_all, features_dir=None):
         agg = {c: 'mean' for c in existing_emotion + existing_pose}
         agg.update({c: 'first' for c in existing_audio})
         agg['final_name']   = 'first'
-        agg['top_emotion']  = _mode_or_nan
+        if 'top_emotion' in spk.columns:
+            agg['top_emotion'] = _mode_or_nan
         agg['frame_number'] = 'count'
 
         seg = (spk.groupby('segment_id').agg(agg)
