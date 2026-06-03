@@ -3,3 +3,5 @@ Frames/
 big_data_venv/
 *.csv
 __pycache__/
+multivideo_analysis/labels_all.pkl
+multivideo_analysis/seg_all.pkl
