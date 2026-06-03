@@ -64,6 +64,13 @@ class SegmentationConfig:
     min_item_duration_s: float = 20.0
     snap_window_s: float = 10.0
     max_topic_clusters: int = 8
+    # Sustained on-screen story straps = visible story starts (same definition as the notebook's
+    # story_straps). Their onsets become anchor boundaries; the fused signal only adds boundaries
+    # in the graphic-less gaps between them.
+    headline_sustained_min_duration_s: float = 12.0
+    headline_sustained_min_obs: int = 4
+    headline_block_gap_s: float = 20.0
+    peak_prominence: float = 0.10
 
 
 def list_newscast_videos(features_dir: str | Path = "Project_Features") -> list[str]:
@@ -201,9 +208,7 @@ def clean_ocr_text(text: str) -> str:
     text = TAG_RE.sub(" ", str(text))
     text = text.replace("\n", " ").replace("\r", " ")
     text = re.sub(r"\s+", " ", text).strip()
-    text = text.upper()
-    text = text.replace("Ç", "C")
-    text = re.sub(r"\s+", " ", text)
+    text = text.upper().replace("Ç", "C")
     return text.strip(" -:;,.")
 
 
@@ -464,16 +469,17 @@ def score_video_boundaries(
     for boundary_s in boundaries:
         idx = int(round(boundary_s))
         evidence = evidence_flags(series, idx)
+        total_score = float(window_max(total, idx))
         rows.append(
             {
                 "video": video,
                 "boundary_s": float(boundary_s),
-                "score": float(window_max(total, idx)),
+                "score": total_score,
                 "semantic_shift": float(window_max(series["semantic_shift"], idx)),
                 "ocr_headline_shift": float(window_max(series["ocr_headline_shift"], idx)),
                 "ocr_layout_shift": float(window_max(series["ocr_layout_shift"], idx)),
                 "nearest_ocr_headline": nearest_headline(headlines, boundary_s),
-                "boundary_confidence": confidence_tier(float(window_max(total, idx)), evidence),
+                "boundary_confidence": confidence_tier(total_score, evidence),
                 "evidence_flags": ",".join(evidence),
                 "before_transcript": transcript_snippet(speech, boundary_s - 20, boundary_s),
                 "after_transcript": transcript_snippet(speech, boundary_s, boundary_s + 20),
@@ -494,14 +500,12 @@ def infer_video_end_s(*frames: pd.DataFrame) -> float:
     for df in frames:
         if df is None or df.empty:
             continue
-        if {"end_s"}.issubset(df.columns):
+        if "end_s" in df.columns:
             candidates.append(float(df["end_s"].max()))
         if {"start_s", "duration"}.issubset(df.columns):
             candidates.append(float((df["start_s"] + df["duration"]).max()))
         if "time_s" in df.columns:
             candidates.append(float(df["time_s"].max()))
-        if "end_s" in df.columns:
-            candidates.append(float(df["end_s"].max()))
     candidates = [c for c in candidates if pd.notna(c) and c > 0]
     return max(candidates) if candidates else 0.0
 
@@ -511,7 +515,10 @@ def compute_semantic_shift(speech: pd.DataFrame, window: int = 3) -> list[tuple[
         return []
     embeddings = speech.get("parsed_text_embedding")
     if embeddings is not None and embeddings.apply(lambda x: isinstance(x, np.ndarray) and x.size > 0).any():
-        return compute_embedding_shift(speech, "parsed_text_embedding", "start_s", window)
+        points = compute_embedding_shift(speech, "parsed_text_embedding", "start_s", window)
+        if points:
+            return points
+    # Fall back to TF-IDF when embeddings exist but are too sparse/inconsistent to yield a signal.
     return compute_tfidf_shift(speech, window)
 
 
@@ -533,30 +540,19 @@ def compute_embedding_shift(
     if len(valid) < window * 2 + 1:
         return []
     matrix = np.stack(valid[embedding_col].values)
-    points = []
-    for i in range(window, len(valid) - window):
-        before = matrix[i - window:i].mean(axis=0)
-        after = matrix[i:i + window].mean(axis=0)
-        score = cosine_distance(before, after)
-        points.append((float(valid.loc[i, time_col]), float(score)))
-    return points
+    return _window_shift_points(matrix, valid[time_col].tolist(), window)
 
 
 def compute_tfidf_shift(speech: pd.DataFrame, window: int = 3) -> list[tuple[float, float]]:
     if len(speech) < window * 2 + 1:
         return []
-    texts = speech.sort_values("start_s")["transcript"].fillna("").astype(str).tolist()
+    ordered = speech.sort_values("start_s").reset_index(drop=True)
+    texts = ordered["transcript"].fillna("").astype(str).tolist()
     if not any(t.strip() for t in texts):
         return []
     vectorizer = TfidfVectorizer(min_df=1, max_features=4000, ngram_range=(1, 2))
     matrix = vectorizer.fit_transform(texts).toarray()
-    points = []
-    ordered = speech.sort_values("start_s").reset_index(drop=True)
-    for i in range(window, len(ordered) - window):
-        before = matrix[i - window:i].mean(axis=0)
-        after = matrix[i:i + window].mean(axis=0)
-        points.append((float(ordered.loc[i, "start_s"]), cosine_distance(before, after)))
-    return points
+    return _window_shift_points(matrix, ordered["start_s"].tolist(), window)
 
 
 def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
@@ -564,6 +560,15 @@ def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
     if denom <= 1e-12:
         return 0.0
     return float(1.0 - np.dot(a, b) / denom)
+
+
+def _window_shift_points(matrix: np.ndarray, times: list[float], window: int) -> list[tuple[float, float]]:
+    points = []
+    for i in range(window, len(times) - window):
+        before = matrix[i - window:i].mean(axis=0)
+        after = matrix[i:i + window].mean(axis=0)
+        points.append((float(times[i]), cosine_distance(before, after)))
+    return points
 
 
 def compute_ocr_layout_shift(ocr: pd.DataFrame) -> list[tuple[float, float]]:
@@ -622,6 +627,47 @@ def smooth_signal(values: np.ndarray, radius: int = 2) -> np.ndarray:
     return np.convolve(values, kernel, mode="same")
 
 
+def sustained_headline_onsets(headlines: pd.DataFrame, cfg: SegmentationConfig) -> list[float]:
+    """Onsets of sustained lower-third story straps (contiguous straps merged into one story block).
+
+    Same notion of an on-screen story start as the notebook's story_straps: a strap shown long/often
+    enough to be a real news package, not a transient OCR fragment.
+    """
+    if headlines.empty:
+        return []
+    sustained = headlines[
+        (headlines["duration_s"] >= cfg.headline_sustained_min_duration_s)
+        & (headlines["observations"] >= cfg.headline_sustained_min_obs)
+    ].sort_values("start_s")
+    onsets: list[float] = []
+    block_end: float | None = None
+    for row in sustained.itertuples(index=False):
+        start_s, end_s = float(row.start_s), float(row.end_s)
+        if block_end is not None and start_s - block_end <= cfg.headline_block_gap_s:
+            block_end = max(block_end, end_s)          # same story block — extend, no new onset
+        else:
+            onsets.append(start_s)
+            block_end = end_s
+    return onsets
+
+
+def sustained_graphic_mask(headlines: pd.DataFrame, n: int, cfg: SegmentationConfig) -> np.ndarray:
+    """Per-second mask of when a sustained story strap is on screen (i.e. inside a news package)."""
+    mask = np.zeros(max(n, 0), dtype=bool)
+    if headlines.empty or n <= 0:
+        return mask
+    sustained = headlines[
+        (headlines["duration_s"] >= cfg.headline_sustained_min_duration_s)
+        & (headlines["observations"] >= cfg.headline_sustained_min_obs)
+    ]
+    for row in sustained.itertuples(index=False):
+        lo = int(max(0, math.floor(float(row.start_s))))
+        hi = int(min(n - 1, math.floor(float(row.end_s))))
+        if hi >= lo:
+            mask[lo:hi + 1] = True
+    return mask
+
+
 def select_boundaries(
     total: np.ndarray,
     series: dict[str, np.ndarray],
@@ -633,34 +679,40 @@ def select_boundaries(
     if len(total) == 0:
         return []
 
-    margin = int(cfg.min_item_duration_s)
-    all_peaks, all_props = find_peaks(
-        total,
-        distance=int(cfg.boundary_min_gap_s),
-        prominence=0.10,
-        wlen=int(min(120, len(total))),
-    )
+    margin = cfg.min_item_duration_s
 
-    keep = (all_peaks >= margin) & (all_peaks <= int(video_end_s) - margin)
-    peak_indices = all_peaks[keep]
-    prominences = all_props["prominences"][keep]
-    if len(peak_indices) == 0:
-        return []
-
-    headline_boost = np.array([
-        1.5 if series["ocr_headline_shift"][idx] >= 0.4 else 1.0
-        for idx in peak_indices
-    ])
-    scores = prominences * headline_boost
-
-    ranked = sorted(zip(peak_indices, scores), key=lambda x: x[1], reverse=True)
-    selected: list[float] = []
-    for idx, _ in ranked:
-        snapped = snap_boundary(float(idx), speech, headlines, cfg.snap_window_s)
-        if snapped < cfg.min_item_duration_s or snapped > video_end_s - cfg.min_item_duration_s:
-            continue
+    def _try_add(candidate: float, selected: list[float]) -> None:
+        snapped = snap_boundary(float(candidate), speech, headlines, cfg.snap_window_s)
+        if snapped < margin or snapped > video_end_s - margin:
+            return
         if all(abs(snapped - existing) >= cfg.boundary_min_gap_s for existing in selected):
             selected.append(snapped)
+
+    # 1) Anchors: every sustained on-screen story start is a boundary (the highest-precision cue).
+    selected: list[float] = []
+    for onset in sustained_headline_onsets(headlines, cfg):
+        _try_add(onset, selected)
+
+    # 2) Secondary boundaries from the fused signal, but ONLY in graphic-less stretches — never cut
+    #    inside a sustained strap, which is one news package. This is where speech/layout earn their keep.
+    graphic = sustained_graphic_mask(headlines, len(total), cfg)
+    peaks, props = find_peaks(
+        total,
+        distance=int(cfg.boundary_min_gap_s),
+        prominence=cfg.peak_prominence,
+        wlen=int(min(120, len(total))),
+    )
+    keep = (peaks >= int(margin)) & (peaks <= int(video_end_s) - int(margin))
+    peaks = peaks[keep]
+    prominences = props["prominences"][keep]
+    candidates = [
+        (int(idx), float(prom))
+        for idx, prom in zip(peaks, prominences)
+        if idx >= len(graphic) or not graphic[idx]
+    ]
+    for idx, _ in sorted(candidates, key=lambda x: x[1], reverse=True):
+        _try_add(float(idx), selected)
+
     return sorted(selected)
 
 
@@ -926,7 +978,6 @@ def assign_topic_clusters(
     if items.empty:
         return items
     items = items.copy()
-    grouped_keys = []
     if "source_item_keys" in items.columns:
         grouped_keys = [
             [key for key in str(keys).split("|") if key]
@@ -957,7 +1008,8 @@ def assign_topic_clusters(
     elif usable.sum() == 1:
         labels[usable] = 0
     else:
-        k = min(max_clusters, max(2, int(round(math.sqrt(int(usable.sum()))))), int(usable.sum()))
+        n_usable = int(usable.sum())
+        k = min(max_clusters, max(2, int(round(math.sqrt(n_usable)))), n_usable)
         labels[usable] = KMeans(n_clusters=k, random_state=42, n_init=10, init="random").fit_predict(matrix[usable])
     items["topic_cluster"] = labels.astype(int)
     return items.drop(columns=["item_text", "source_item_keys"], errors="ignore")
