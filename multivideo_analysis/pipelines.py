@@ -672,8 +672,13 @@ def build_seg_all(debate_videos, data_audio, labels_all, features_dir=None):
         df_all = df_all.merge(audio_by_frame, on='frame_number', how='left')
         df_all['has_audio']     = df_all['has_audio'].fillna(False)
         df_all['segment_id']    = df_all['segment_id'].fillna(-1).astype(int)
+        # per-frame speaker is contaminated at segment boundaries; use the mode
+        # across the segment's frames instead (mirrors corelations_updated cell 17)
+        owner = (df_all[df_all['has_audio']]
+                 .groupby('segment_id')['speaker'].agg(_mode_or_nan))
+        df_all['seg_speaker']   = df_all['segment_id'].map(owner)
         df_all['speaking_face'] = (df_all['has_audio'] &
-                                   (df_all['final_name'] == df_all['speaker']))
+                                   (df_all['final_name'] == df_all['seg_speaker']))
 
         # ── segment aggregation (corelations_updated cell 16) ─────────────────
         spk = df_all[df_all['speaking_face']].copy()
@@ -686,6 +691,7 @@ def build_seg_all(debate_videos, data_audio, labels_all, features_dir=None):
 
         agg = {c: 'mean' for c in existing_emotion + existing_pose}
         agg.update({c: 'first' for c in existing_audio})
+        agg['seg_speaker']  = 'first'
         agg['final_name']   = 'first'
         if 'top_emotion' in spk.columns:
             agg['top_emotion'] = _mode_or_nan
