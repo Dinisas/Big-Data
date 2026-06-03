@@ -11,12 +11,16 @@ import os
 import math
 import numpy as np
 import pandas as pd
+from scipy.datasets import face
 from sklearn.cluster import KMeans
 from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import StandardScaler
 from scipy.spatial.distance import cdist
 
 FEATURES_DIR = '../Project_Features'
+
+THR_LANGUAGE_Y =450
+THR_LANGUAGE_AREA = 80000
 
 CANDIDATES = [
     'Cotrim_Figueiredo', 'Filipe', 'Gouveia_Melo',
@@ -199,6 +203,12 @@ def build_visual_features(video_name, features_dir=None):
     def _dist(a, b):
         # visual_label.ipynb / visual_and_audio.ipynb cell 5: dist()
         return math.sqrt((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2)
+    
+    def is_interpreter(face):
+        x1, y1, x2, y2 = face['bbox']
+        y_center = (y1 + y2) / 2
+        area = (x2 - x1) * (y2 - y1)
+        return (y_center > THR_LANGUAGE_Y) and (area < THR_LANGUAGE_AREA)
 
     df = pd.read_pickle(os.path.join(fd, f'{video_name}_visual.pkl'))
     df['Video_Name']   = df['Frame'].str.extract(r'Frames/([^/]+)/')
@@ -212,15 +222,20 @@ def build_visual_features(video_name, features_dir=None):
 
     # visual_and_audio.ipynb cell 5: main per-frame loop
     for _, row in df.iterrows():
-        frame_id     = row['Frame']
+        frame_id = row['Frame']
         frame_number = row['Frame_Number']
-        faces        = row['Fer']
-        poses        = row['Poses']
+        faces = row['Fer']
+        poses= row['Poses']
 
-        if isinstance(faces, list) and 0 < len(faces) <= 3:
-            valid_faces  = [f for f in faces if isinstance(f, dict) and 'bbox' in f]
-            people_count = len(valid_faces)
+        if isinstance(faces, list) and len(faces) > 0:
+            valid_faces = [f for f in faces if isinstance(f, dict) and 'bbox' in f]
+            valid_faces = [f for f in valid_faces if not is_interpreter(f)]  # drop sign-language insets
+        else:
+            valid_faces = []
+        
+        people_count = len(valid_faces)
 
+        if 0 < people_count <= 3:
             for i, face in enumerate(valid_faces):
                 f_box    = face['bbox']
                 f_width  = f_box[2] - f_box[0]
