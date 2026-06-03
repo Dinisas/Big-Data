@@ -20,7 +20,7 @@ from scipy.spatial.distance import cdist
 FEATURES_DIR = '../Project_Features'
 
 THR_LANGUAGE_Y =450
-THR_LANGUAGE_AREA = 80000
+THR_LANGUAGE_AREA = 8000
 
 CANDIDATES = [
     'Cotrim_Figueiredo', 'Filipe', 'Gouveia_Melo',
